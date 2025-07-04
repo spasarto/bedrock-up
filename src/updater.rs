@@ -127,19 +127,22 @@ fn apply_update(server_path: String, zip_path: &std::path::Path, exclude: Vec<St
             None => continue,
         };
 
-        if exclude_set.contains(out_path.to_str().unwrap_or("")) {
-            println!("Skipping excluded file: {}", out_path.display());
-            continue;
-        }
+        let should_exclude = exclude_set.contains(out_path.to_str().unwrap_or(""));
 
         let out_path = server_path.join(out_path);
 
+        let should_exclude = should_exclude && std::fs::metadata(&out_path).is_ok();
+        if should_exclude {
+            println!("Skipping excluded file: {}", out_path.display());
+            continue;
+        }
         if file.is_dir() {
             std::fs::create_dir_all(&out_path).unwrap();
         } else {
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
+
             let mut outfile = std::fs::File::create(&out_path).unwrap();
             std::io::copy(&mut file, &mut outfile).unwrap();
         }
