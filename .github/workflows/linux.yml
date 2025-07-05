@@ -1,4 +1,4 @@
-name: Rust
+name: linux
 
 on:
   push:
@@ -24,18 +24,3 @@ jobs:
       with:
         name: bedrock-up-linux-${{env.VERSION}}
         path: target/x86_64-unknown-linux-gnu/release/bedrock-up
-
-  build-windows:
-    runs-on: windows-latest
-
-    steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --release --target=x86_64-pc-windows-gnu
-    - name: Get Version
-      run: echo "VERSION=$(grep -m 1 'version = ' Cargo.toml | cut -d '"' -f 2)" >> $GITHUB_ENV
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: bedrock-up-windows-${{env.VERSION}}
-        path: target/x86_64-pc-windows-gnu/release/bedrock-up.exe

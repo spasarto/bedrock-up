@@ -1,5 +1,8 @@
 # BEDROCK-UP
 
+[![Linux](https://github.com/spasarto/bedrock-up/actions/workflows/linux.yml/badge.svg)](https://github.com/spasarto/bedrock-up/actions/workflows/linux.yml)
+[![Windows](https://github.com/spasarto/bedrock-up/actions/workflows/windows.yml/badge.svg)](https://github.com/spasarto/bedrock-up/actions/workflows/windows.yml)
+
 Fast and efficient Minecraft Bedrock Edition server updater. Supports Windows and Linux as well as the preview versions.
 
 ## Usage
@@ -33,6 +36,6 @@ bedrock-up -d windows -s C:\minecraft
 bedrock-up -d linux -s ~/minecraft
 ```
 
-## Notes
+## Usage Notes
 
 The first time running the update, the update will always be applied since there is no cache built yet.
