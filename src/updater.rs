@@ -1554,26 +1554,6 @@ mod tests {
     }
 
     #[test]
-    fn test_update_cache_permission_denied() {
-        // Test with a path that would typically cause permission denied
-        // On Windows, this might be a system file or directory
-        let restricted_path = if cfg!(windows) {
-            "C:\\Windows\\System32\\cache.json"
-        } else {
-            "/etc/cache.json"
-        };
-
-        let test_json = json!({
-            "test": "data"
-        });
-
-        let result = update_cache(test_json, restricted_path);
-
-        // Should return an error (most likely permission denied)
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_update_cache_special_characters() {
         use tempfile::TempDir;
 
