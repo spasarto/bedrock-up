@@ -22,6 +22,16 @@ Options:
   -V, --version                        Print version
 ```
 
+## Installation
+
+If you have `cargo`
+
+```shell
+cargo install --git https://github.com/spasarto/bedrock-up.git
+```
+
+If you don't have cargo, check out the releases 👉
+
 ## Example Usage
 
 ### Windows
