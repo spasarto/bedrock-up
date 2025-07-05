@@ -39,3 +39,7 @@ bedrock-up -d linux -s ~/minecraft
 ## Usage Notes
 
 The first time running the update, the update will always be applied since there is no cache built yet.
+
+## How It Works
+
+The Minecraft Bedrock Dedicated Server page makes a call out to an API to get the latest server versions. Rather than manipulating and scaping the page, this app calls the same API. This assumes a level of risk since it is an internal API. However, it is my hope that Microsoft agrees that API calls is preferable to web scraping. Should the backend API change, please submit an issue!
