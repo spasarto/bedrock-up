@@ -20,10 +20,12 @@ jobs:
     - name: Test
       run: cargo test --release --target=x86_64-pc-windows-gnu
     - name: Get Version
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: |
         $version = (Get-Content Cargo.toml | Select-String 'version = ' | Select-Object -First 1).Line -replace '.*version = "([^"]*)".*', '$1'
         echo "VERSION=$version" >> $env:GITHUB_ENV
     - name: Upload Artifact
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       uses: actions/upload-artifact@v4
       with:
         name: bedrock-up-windows-${{env.VERSION}}
