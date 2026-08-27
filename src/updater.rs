@@ -1,13 +1,21 @@
 use crate::args::{DownloadType, UpdateArgs};
 
-pub fn update(args: UpdateArgs) {
+/// Outcome of a successful `update()` call, used by callers (e.g. a scheduled
+/// task wrapper) to decide whether the server actually needs to be restarted.
+pub enum UpdateOutcome {
+    Updated,
+    AlreadyCurrent,
+}
+
+pub fn update(args: UpdateArgs) -> Result<UpdateOutcome, String> {
     let web_json = get_json_from_web();
     if web_json.is_null() {
-        return;
+        return Err("Failed to fetch update information from the web.".to_string());
     }
 
     let cache_json = get_json_from_cache(&args.cache_path);
-    let web_download_url = get_download_url_from_json(&web_json, &args.download_type).unwrap();
+    let web_download_url = get_download_url_from_json(&web_json, &args.download_type)
+        .ok_or_else(|| format!("No download URL found for {}", args.download_type))?;
     let cache_download_url =
         get_download_url_from_json(&cache_json, &args.download_type).unwrap_or("0.0.0".to_owned());
 
@@ -19,21 +27,28 @@ pub fn update(args: UpdateArgs) {
             "You are already on the latest version: {}",
             cache_download_url
         );
-        return;
+        return Ok(UpdateOutcome::AlreadyCurrent);
     }
 
     println!("New version available: {}", web_download_url);
-    let Some(zip_path) = fetch_update_zip(&web_download_url) else {
-        return;
-    };
+    let zip_path =
+        fetch_update_zip(&web_download_url).ok_or_else(|| "Failed to download update archive.".to_string())?;
 
-    apply_update(args.server_path, &zip_path, args.exclude);
-    std::fs::remove_file(zip_path).unwrap();
-
-    if let Err(e) = update_cache(web_json, &args.cache_path) {
-        eprintln!("Failed to update cache: {}", e);
+    let apply_result = apply_update(args.server_path, &zip_path, args.exclude);
+    if let Err(e) = std::fs::remove_file(&zip_path) {
+        eprintln!(
+            "Warning: failed to remove temp file {}: {}",
+            zip_path.display(),
+            e
+        );
     }
+    apply_result?;
+
+    update_cache(web_json, &args.cache_path)
+        .map_err(|e| format!("Update applied but failed to update cache: {}", e))?;
+
     println!("Update applied successfully.");
+    Ok(UpdateOutcome::Updated)
 }
 
 fn get_json_from_web() -> serde_json::Value {
@@ -117,16 +132,25 @@ fn fetch_update_zip(download_url: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-fn apply_update(server_path: String, zip_path: &std::path::Path, exclude: Vec<String>) {
+fn apply_update(
+    server_path: String,
+    zip_path: &std::path::Path,
+    exclude: Vec<String>,
+) -> Result<(), String> {
     println!("Applying update from: {}", zip_path.display());
     println!("Excluded files: {:?}", exclude);
 
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path).unwrap()).unwrap();
+    let zip_file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open update archive {}: {}", zip_path.display(), e))?;
+    let mut archive = zip::ZipArchive::new(zip_file)
+        .map_err(|e| format!("Failed to read update archive {}: {}", zip_path.display(), e))?;
     let server_path = std::path::PathBuf::from(shellexpand::tilde(&server_path).to_string());
     let exclude_set: std::collections::HashSet<_> = exclude.into_iter().collect();
 
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i).unwrap();
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to read entry {} from update archive: {}", i, e))?;
         let out_path = match file.enclosed_name() {
             Some(path) => path,
             None => continue,
@@ -142,16 +166,29 @@ fn apply_update(server_path: String, zip_path: &std::path::Path, exclude: Vec<St
             continue;
         }
         if file.is_dir() {
-            std::fs::create_dir_all(&out_path).unwrap();
+            std::fs::create_dir_all(&out_path)
+                .map_err(|e| format!("Failed to create directory {}: {}", out_path.display(), e))?;
         } else {
             if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create directory {}: {}", parent.display(), e)
+                })?;
             }
 
-            let mut outfile = std::fs::File::create(&out_path).unwrap();
-            std::io::copy(&mut file, &mut outfile).unwrap();
+            let mut outfile = std::fs::File::create(&out_path).map_err(|e| {
+                format!(
+                    "Failed to write {} ({}). Is the Minecraft server still running?",
+                    out_path.display(),
+                    e
+                )
+            })?;
+            std::io::copy(&mut file, &mut outfile).map_err(|e| {
+                format!("Failed to write contents of {}: {}", out_path.display(), e)
+            })?;
         }
     }
+
+    Ok(())
 }
 
 fn update_cache(web_json: serde_json::Value, cache_path: &str) -> std::io::Result<()> {

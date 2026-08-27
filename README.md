@@ -50,6 +50,16 @@ bedrock-up -d linux -s ~/minecraft
 
 The first time running the update, the update will always be applied since there is no cache built yet.
 
+`bedrock-up` does not manage the Minecraft server process itself — it only downloads and writes files. If the server is running, files it needs to overwrite (like the server executable) will be locked, and the update will fail. Stop the server before running `bedrock-up` and start it again afterward, e.g. from a wrapper script driven by your scheduler.
+
+The process exit code tells you whether a restart is actually needed:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Already on the latest version — no files were changed |
+| `1` | An error occurred — no assumptions should be made about the server directory |
+| `2` | Update was applied — the server should be (re)started |
+
 ## How It Works
 
 The Minecraft Bedrock Dedicated Server page makes a call out to an API to get the latest server versions. Rather than manipulating and scaping the page, this app calls the same API. This assumes a level of risk since it is an internal API. However, it is my hope that Microsoft agrees that API calls is preferable to web scraping. Should the backend API change, please submit an issue!
