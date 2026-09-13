@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bedrock_up::UpdateConfig;
 use clap::Parser;
 
 use crate::server::ServerConfig;
+use crate::supervisor::SupervisorConfig;
 
 /// Which server build this is. Picks the default launch command; not the
 /// same type as `bedrock-up`'s `DownloadType`, since the library builds
@@ -47,6 +49,38 @@ pub struct SupervisorArgs {
     #[arg(long, default_value_t = 60)]
     pub stop_timeout: u64,
 
+    /// Where to cache the current version info, to detect updates.
+    #[arg(short, long, default_value = "~/.bedrock-up/links.json")]
+    pub cache_path: String,
+
+    /// Files to leave alone if they already exist when applying an update.
+    #[arg(
+        short,
+        long,
+        value_parser,
+        value_delimiter = ' ',
+        default_values = ["server.properties",
+        "permissions.json",
+        "allowlist.json"]
+    )]
+    pub exclude: Vec<String>,
+
+    /// Apply an update even if the cached version already matches.
+    #[arg(short, long, default_value_t = false)]
+    pub force: bool,
+
+    /// How often to check for updates, in seconds. 0 disables automatic
+    /// update checks, leaving a supervisor that only babysits and restarts.
+    #[arg(long, default_value_t = 6 * 60 * 60)]
+    pub check_interval: u64,
+
+    /// Check for and apply an update before starting the server, instead of
+    /// waiting for the first tick. Off by default: a service manager
+    /// restarting the supervisor (reboot, crash, config fix) should not
+    /// cascade into an update every time.
+    #[arg(long, default_value_t = false)]
+    pub update_on_start: bool,
+
     /// Extra arguments passed through to the server process.
     #[arg(last = true)]
     pub server_args: Vec<String>,
@@ -65,6 +99,10 @@ impl SupervisorArgs {
     pub fn stop_timeout(&self) -> Duration {
         Duration::from_secs(self.stop_timeout)
     }
+
+    pub fn check_interval(&self) -> Duration {
+        Duration::from_secs(self.check_interval)
+    }
 }
 
 impl From<&SupervisorArgs> for ServerConfig {
@@ -74,6 +112,37 @@ impl From<&SupervisorArgs> for ServerConfig {
             kind: args.download_type.clone(),
             server_exe: args.server_exe.clone(),
             extra_args: args.server_args.clone(),
+        }
+    }
+}
+
+impl From<&ServerKind> for bedrock_up::DownloadType {
+    fn from(kind: &ServerKind) -> Self {
+        match kind {
+            ServerKind::Windows => bedrock_up::DownloadType::Windows,
+            ServerKind::Linux => bedrock_up::DownloadType::Linux,
+            ServerKind::PreviewWindows => bedrock_up::DownloadType::PreviewWindows,
+            ServerKind::PreviewLinux => bedrock_up::DownloadType::PreviewLinux,
+            ServerKind::ServerJar => bedrock_up::DownloadType::ServerJar,
+        }
+    }
+}
+
+impl From<&SupervisorArgs> for SupervisorConfig {
+    fn from(args: &SupervisorArgs) -> Self {
+        SupervisorConfig {
+            server: ServerConfig::from(args),
+            update: UpdateConfig {
+                download_type: (&args.download_type).into(),
+                server_path: PathBuf::from(shellexpand::tilde(&args.server_path).to_string()),
+                cache_path: PathBuf::from(shellexpand::tilde(&args.cache_path).to_string()),
+                exclude: args.exclude.clone(),
+                force: args.force,
+            },
+            warn_at: args.warn_at_seconds(),
+            stop_timeout: args.stop_timeout(),
+            check_interval: args.check_interval(),
+            update_on_start: args.update_on_start,
         }
     }
 }
