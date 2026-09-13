@@ -50,15 +50,22 @@ bedrock-up -d linux -s ~/minecraft
 
 The first time running the update, the update will always be applied since there is no cache built yet.
 
-`bedrock-up` does not manage the Minecraft server process itself — it only downloads and writes files. If the server is running, files it needs to overwrite (like the server executable) will be locked, and the update will fail. Stop the server before running `bedrock-up` and start it again afterward, e.g. from a wrapper script driven by your scheduler.
+### Exit codes
 
-The process exit code tells you whether a restart is actually needed:
+The exit code tells a wrapper script whether a restart is needed:
 
 | Exit code | Meaning |
 |---|---|
 | `0` | Already on the latest version — no files were changed |
 | `1` | An error occurred — no assumptions should be made about the server directory |
-| `2` | Update was applied — the server should be (re)started |
+| `2` | New files are on disk — restart the server to run them |
+
+For example, restarting only when an update actually landed:
+
+```powershell
+bedrock-up -d windows -s C:\minecraft
+if ($LASTEXITCODE -eq 2) { Restart-Service minecraft }
+```
 
 ## How It Works
 

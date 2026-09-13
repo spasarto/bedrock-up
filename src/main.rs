@@ -1,5 +1,6 @@
 mod args;
 use args::UpdateArgs;
+mod process;
 mod updater;
 use clap::{CommandFactory, Parser};
 use updater::{UpdateOutcome, update};
@@ -12,7 +13,9 @@ fn main() {
     let args = UpdateArgs::try_parse();
     let exit_code = match args {
         Ok(args) => match update(args) {
-            Ok(UpdateOutcome::Updated) => UPDATE_APPLIED,
+            // Both mean new files are on disk and the server should be
+            // (re)started to run them.
+            Ok(UpdateOutcome::Updated) | Ok(UpdateOutcome::UpdatedPendingRestart) => UPDATE_APPLIED,
             Ok(UpdateOutcome::AlreadyCurrent) => ALREADY_CURRENT,
             Err(e) => {
                 eprintln!("Error: {}", e);

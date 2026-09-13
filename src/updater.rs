@@ -1,9 +1,16 @@
 use crate::args::{DownloadType, UpdateArgs};
 
+/// Marks a file that was in use and had to be renamed aside to make room for
+/// its replacement.
+const STALE_MARKER: &str = ".bedrock-up-old";
+
 /// Outcome of a successful `update()` call, used by callers (e.g. a scheduled
 /// task wrapper) to decide whether the server actually needs to be restarted.
 pub enum UpdateOutcome {
     Updated,
+    /// The update was written, but some files were in use and were staged in
+    /// place. The running server keeps the old build until it is restarted.
+    UpdatedPendingRestart,
     AlreadyCurrent,
 }
 
@@ -31,10 +38,19 @@ pub fn update(args: UpdateArgs) -> Result<UpdateOutcome, String> {
     }
 
     println!("New version available: {}", web_download_url);
-    let zip_path =
-        fetch_update_zip(&web_download_url).ok_or_else(|| "Failed to download update archive.".to_string())?;
+    let server_path = std::path::PathBuf::from(shellexpand::tilde(&args.server_path).to_string());
 
-    let apply_result = apply_update(args.server_path, &zip_path, args.exclude);
+    // Files staged by a previous update can only be deleted once the server
+    // that had them open has restarted, so clear them out now.
+    let swept = sweep_stale_files(&server_path);
+    if swept > 0 {
+        println!("Cleaned up {} file(s) staged by a previous update.", swept);
+    }
+
+    let zip_path = fetch_update_zip(&web_download_url)
+        .ok_or_else(|| "Failed to download update archive.".to_string())?;
+
+    let apply_result = apply_update(&server_path, &zip_path, args.exclude);
     if let Err(e) = std::fs::remove_file(&zip_path) {
         eprintln!(
             "Warning: failed to remove temp file {}: {}",
@@ -42,13 +58,37 @@ pub fn update(args: UpdateArgs) -> Result<UpdateOutcome, String> {
             e
         );
     }
-    apply_result?;
+    let staged = apply_result?;
 
     update_cache(web_json, &args.cache_path)
         .map_err(|e| format!("Update applied but failed to update cache: {}", e))?;
 
-    println!("Update applied successfully.");
-    Ok(UpdateOutcome::Updated)
+    if staged.is_empty() {
+        println!("Update applied successfully.");
+        return Ok(UpdateOutcome::Updated);
+    }
+
+    println!(
+        "Update applied successfully. {} file(s) were in use and were staged in place.",
+        staged.len()
+    );
+    report_running_servers(&server_path);
+    Ok(UpdateOutcome::UpdatedPendingRestart)
+}
+
+/// Names the processes still running the previous build out of `server_path`,
+/// so the caller knows exactly what has to be restarted.
+fn report_running_servers(server_path: &std::path::Path) {
+    let running = crate::process::find_server_processes(server_path);
+    if running.is_empty() {
+        println!("No running server found for this path; the update is already live.");
+        return;
+    }
+
+    println!("Restart the following to activate the new version:");
+    for process in running {
+        println!("  PID {} ({})", process.pid, process.exe.display());
+    }
 }
 
 fn get_json_from_web() -> serde_json::Value {
@@ -132,20 +172,32 @@ fn fetch_update_zip(download_url: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Applies the archive over the server directory, returning the files that had
+/// to be staged because they were in use.
 fn apply_update(
-    server_path: String,
+    server_path: &std::path::Path,
     zip_path: &std::path::Path,
     exclude: Vec<String>,
-) -> Result<(), String> {
+) -> Result<Vec<std::path::PathBuf>, String> {
     println!("Applying update from: {}", zip_path.display());
     println!("Excluded files: {:?}", exclude);
 
-    let zip_file = std::fs::File::open(zip_path)
-        .map_err(|e| format!("Failed to open update archive {}: {}", zip_path.display(), e))?;
-    let mut archive = zip::ZipArchive::new(zip_file)
-        .map_err(|e| format!("Failed to read update archive {}: {}", zip_path.display(), e))?;
-    let server_path = std::path::PathBuf::from(shellexpand::tilde(&server_path).to_string());
+    let zip_file = std::fs::File::open(zip_path).map_err(|e| {
+        format!(
+            "Failed to open update archive {}: {}",
+            zip_path.display(),
+            e
+        )
+    })?;
+    let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| {
+        format!(
+            "Failed to read update archive {}: {}",
+            zip_path.display(),
+            e
+        )
+    })?;
     let exclude_set: std::collections::HashSet<_> = exclude.into_iter().collect();
+    let mut staged = Vec::new();
 
     for i in 0..archive.len() {
         let mut file = archive
@@ -175,20 +227,125 @@ fn apply_update(
                 })?;
             }
 
-            let mut outfile = std::fs::File::create(&out_path).map_err(|e| {
-                format!(
-                    "Failed to write {} ({}). Is the Minecraft server still running?",
-                    out_path.display(),
-                    e
-                )
-            })?;
+            let (mut outfile, was_staged) = create_replacing_in_use(&out_path)?;
+            if was_staged {
+                println!("Staged in-use file: {}", out_path.display());
+                staged.push(out_path.clone());
+            }
             std::io::copy(&mut file, &mut outfile).map_err(|e| {
                 format!("Failed to write contents of {}: {}", out_path.display(), e)
             })?;
         }
     }
 
-    Ok(())
+    Ok(staged)
+}
+
+/// Opens `out_path` for writing, renaming an existing file out of the way if the
+/// OS refuses to replace it because it is in use.
+///
+/// Windows lets a running executable be renamed even though it cannot be
+/// overwritten or deleted, and Linux lets one be unlinked. Either way the
+/// running server keeps the file it already has open while the new version
+/// lands in its place and takes effect on the next start. Returns whether the
+/// file had to be staged this way.
+fn create_replacing_in_use(out_path: &std::path::Path) -> Result<(std::fs::File, bool), String> {
+    match std::fs::File::create(out_path) {
+        Ok(file) => Ok((file, false)),
+        Err(e) if is_in_use_error(&e) => {
+            // Guaranteed not to name an existing file, so nothing staged by an
+            // earlier update is disturbed or blocks the rename.
+            let stale = stale_path(out_path);
+            std::fs::rename(out_path, &stale).map_err(|e| {
+                format!(
+                    "{} is in use and could not be renamed aside: {}",
+                    out_path.display(),
+                    e
+                )
+            })?;
+            let file = std::fs::File::create(out_path).map_err(|e| {
+                format!(
+                    "Failed to write {} after staging the in-use copy: {}",
+                    out_path.display(),
+                    e
+                )
+            })?;
+            Ok((file, true))
+        }
+        Err(e) => Err(format!("Failed to write {}: {}", out_path.display(), e)),
+    }
+}
+
+/// Picks the name to move an in-use file aside to.
+///
+/// A file staged by an earlier update can still be held open by a server that
+/// has not restarted yet, and such a file can be neither deleted nor replaced.
+/// Stepping past names that are already taken keeps a second update from
+/// clashing with the first, so any number of updates can be applied between
+/// restarts.
+fn stale_path(out_path: &std::path::Path) -> std::path::PathBuf {
+    let staged_name = |suffix: &str| {
+        let mut name = out_path.as_os_str().to_os_string();
+        name.push(STALE_MARKER);
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+
+    let mut candidate = staged_name("");
+    let mut attempt = 1u32;
+    while candidate.exists() {
+        candidate = staged_name(&format!(".{}", attempt));
+        attempt += 1;
+    }
+
+    candidate
+}
+
+/// Whether `path` names a file that an earlier update moved aside.
+fn is_stale_file(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((_, tail)) = name.split_once(STALE_MARKER) else {
+        return false;
+    };
+
+    // Either the bare marker, or the marker plus a `.N` disambiguator.
+    tail.is_empty()
+        || tail
+            .strip_prefix('.')
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether the error means the file is held open by a running process.
+fn is_in_use_error(e: &std::io::Error) -> bool {
+    if cfg!(windows) {
+        // ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32).
+        matches!(e.raw_os_error(), Some(5) | Some(32))
+    } else {
+        // ETXTBSY: cannot write to a currently-executing binary.
+        matches!(e.raw_os_error(), Some(26))
+    }
+}
+
+/// Removes files staged by earlier updates. They can only be deleted once the
+/// server holding them open has restarted, so this is best-effort and silently
+/// leaves behind any that are still in use. Returns how many were removed.
+fn sweep_stale_files(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            removed += sweep_stale_files(&path);
+        } else if is_stale_file(&path) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn update_cache(web_json: serde_json::Value, cache_path: &str) -> std::io::Result<()> {
@@ -1748,5 +1905,483 @@ mod tests {
         assert!(parsed["thread_id"].is_number());
         let thread_id = parsed["thread_id"].as_u64().unwrap();
         assert!(thread_id < 3);
+    }
+
+    // Helpers for the apply_update / staging tests
+
+    fn write_test_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+
+        for (name, contents) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    /// The name the first staged copy of `path` takes. Unlike `stale_path`,
+    /// this does not step past names already taken, so tests can name the file
+    /// staging produced rather than the one the next staging would produce.
+    fn bare_stale_path(path: &std::path::Path) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(STALE_MARKER);
+        std::path::PathBuf::from(name)
+    }
+
+    /// Opens `path` the way Windows holds a running executable: readable and
+    /// renameable by others, but not writable. Returns the handle; the lock
+    /// lasts until it is dropped.
+    #[cfg(windows)]
+    fn lock_like_running_exe(path: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)
+            .unwrap()
+    }
+
+    // Tests for apply_update
+
+    #[test]
+    fn test_apply_update_writes_all_files() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        let zip_path = temp_dir.path().join("update.zip");
+
+        write_test_zip(
+            &zip_path,
+            &[
+                ("bedrock_server.exe", b"new binary"),
+                ("behavior_packs/pack/manifest.json", b"{}"),
+            ],
+        );
+
+        let staged = apply_update(&server_path, &zip_path, vec![]).unwrap();
+
+        assert!(staged.is_empty());
+        assert_eq!(
+            std::fs::read(server_path.join("bedrock_server.exe")).unwrap(),
+            b"new binary"
+        );
+        assert_eq!(
+            std::fs::read(server_path.join("behavior_packs/pack/manifest.json")).unwrap(),
+            b"{}"
+        );
+    }
+
+    #[test]
+    fn test_apply_update_skips_existing_excluded_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        std::fs::create_dir_all(&server_path).unwrap();
+        std::fs::write(server_path.join("server.properties"), b"my settings").unwrap();
+
+        let zip_path = temp_dir.path().join("update.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("server.properties", b"default settings"),
+                ("bedrock_server.exe", b"new binary"),
+            ],
+        );
+
+        let staged = apply_update(
+            &server_path,
+            &zip_path,
+            vec!["server.properties".to_string()],
+        )
+        .unwrap();
+
+        assert!(staged.is_empty());
+        // The existing config survives, the binary still updates.
+        assert_eq!(
+            std::fs::read(server_path.join("server.properties")).unwrap(),
+            b"my settings"
+        );
+        assert_eq!(
+            std::fs::read(server_path.join("bedrock_server.exe")).unwrap(),
+            b"new binary"
+        );
+    }
+
+    #[test]
+    fn test_apply_update_writes_excluded_file_when_absent() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        let zip_path = temp_dir.path().join("update.zip");
+
+        write_test_zip(&zip_path, &[("server.properties", b"default settings")]);
+
+        // Nothing to preserve on a fresh install, so the default is written.
+        let staged = apply_update(
+            &server_path,
+            &zip_path,
+            vec!["server.properties".to_string()],
+        )
+        .unwrap();
+
+        assert!(staged.is_empty());
+        assert_eq!(
+            std::fs::read(server_path.join("server.properties")).unwrap(),
+            b"default settings"
+        );
+    }
+
+    #[test]
+    fn test_apply_update_missing_archive() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        let zip_path = temp_dir.path().join("does-not-exist.zip");
+
+        let result = apply_update(&server_path, &zip_path, vec![]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_update_overwrites_existing_files() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        std::fs::create_dir_all(&server_path).unwrap();
+        std::fs::write(server_path.join("bedrock_server.exe"), b"old binary").unwrap();
+
+        let zip_path = temp_dir.path().join("update.zip");
+        write_test_zip(&zip_path, &[("bedrock_server.exe", b"new binary")]);
+
+        let staged = apply_update(&server_path, &zip_path, vec![]).unwrap();
+
+        // Nothing held the file open, so it is replaced directly.
+        assert!(staged.is_empty());
+        assert_eq!(
+            std::fs::read(server_path.join("bedrock_server.exe")).unwrap(),
+            b"new binary"
+        );
+        assert!(
+            !server_path
+                .join(format!("bedrock_server.exe{}", STALE_MARKER))
+                .exists()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_apply_update_stages_in_use_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        std::fs::create_dir_all(&server_path).unwrap();
+
+        let exe_path = server_path.join("bedrock_server.exe");
+        std::fs::write(&exe_path, b"old binary").unwrap();
+        let _lock = lock_like_running_exe(&exe_path);
+
+        let zip_path = temp_dir.path().join("update.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("bedrock_server.exe", b"new binary"),
+                ("definitions/thing.json", b"{}"),
+            ],
+        );
+
+        let staged = apply_update(&server_path, &zip_path, vec![]).unwrap();
+
+        // The locked binary is reported as staged, the rest applies normally.
+        assert_eq!(staged, vec![exe_path.clone()]);
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"new binary");
+        assert_eq!(
+            std::fs::read(server_path.join("definitions/thing.json")).unwrap(),
+            b"{}"
+        );
+
+        // The running server's copy is preserved under the stale name.
+        let stale = bare_stale_path(&exe_path);
+        assert!(stale.exists());
+        assert_eq!(std::fs::read(&stale).unwrap(), b"old binary");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_apply_update_stages_twice_without_restart() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        std::fs::create_dir_all(&server_path).unwrap();
+
+        let exe_path = server_path.join("bedrock_server.exe");
+        std::fs::write(&exe_path, b"v1").unwrap();
+
+        // An instance is running v1 and holds it open.
+        let _running_v1 = lock_like_running_exe(&exe_path);
+
+        let v2_zip = temp_dir.path().join("v2.zip");
+        write_test_zip(&v2_zip, &[("bedrock_server.exe", b"v2")]);
+        let staged_v2 = apply_update(&server_path, &v2_zip, vec![]).unwrap();
+        assert_eq!(staged_v2.len(), 1);
+
+        // A second instance starts and holds the freshly written v2 open, while
+        // the first is still running v1 out of the staged file.
+        let _running_v2 = lock_like_running_exe(&exe_path);
+
+        let v3_zip = temp_dir.path().join("v3.zip");
+        write_test_zip(&v3_zip, &[("bedrock_server.exe", b"v3")]);
+        let staged_v3 = apply_update(&server_path, &v3_zip, vec![])
+            .expect("second update must not clash with the file staged by the first");
+        assert_eq!(staged_v3.len(), 1);
+
+        // v3 is live on disk and neither running instance lost its binary.
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"v3");
+        let preserved: std::collections::HashSet<Vec<u8>> = std::fs::read_dir(&server_path)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_stale_file(path))
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        assert_eq!(
+            preserved,
+            [b"v1".to_vec(), b"v2".to_vec()].into_iter().collect()
+        );
+    }
+
+    // Tests for create_replacing_in_use
+
+    #[test]
+    fn test_create_replacing_in_use_writes_normally() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("file.txt");
+        std::fs::write(&path, b"old").unwrap();
+
+        let (mut file, was_staged) = create_replacing_in_use(&path).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+
+        assert!(!was_staged);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!bare_stale_path(&path).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_create_replacing_in_use_stages_locked_file() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("bedrock_server.exe");
+        std::fs::write(&path, b"old").unwrap();
+        let _lock = lock_like_running_exe(&path);
+
+        let (mut file, was_staged) = create_replacing_in_use(&path).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+
+        assert!(was_staged);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read(bare_stale_path(&path)).unwrap(), b"old");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_create_replacing_in_use_preserves_previous_stale_file() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("bedrock_server.exe");
+        std::fs::write(&path, b"old").unwrap();
+
+        // Left over from an earlier update, still in use by the server that has
+        // not restarted yet, so it must not be reused or removed.
+        let existing_stale = temp_dir
+            .path()
+            .join(format!("bedrock_server.exe{}", STALE_MARKER));
+        std::fs::write(&existing_stale, b"ancient").unwrap();
+        let _lock = lock_like_running_exe(&path);
+
+        let (mut file, was_staged) = create_replacing_in_use(&path).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+
+        assert!(was_staged);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read(&existing_stale).unwrap(), b"ancient");
+        assert_eq!(
+            std::fs::read(
+                temp_dir
+                    .path()
+                    .join(format!("bedrock_server.exe{}.1", STALE_MARKER))
+            )
+            .unwrap(),
+            b"old"
+        );
+    }
+
+    // Tests for stale_path and sweep_stale_files
+
+    #[test]
+    fn test_stale_path_appends_suffix() {
+        let path = std::path::Path::new("/srv/minecraft/bedrock_server.exe");
+
+        let stale = stale_path(path);
+
+        assert_eq!(
+            stale.file_name().unwrap().to_str().unwrap(),
+            format!("bedrock_server.exe{}", STALE_MARKER)
+        );
+        assert_eq!(stale.parent(), path.parent());
+    }
+
+    #[test]
+    fn test_stale_path_steps_past_taken_names() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("bedrock_server.exe");
+        std::fs::write(&path, b"current").unwrap();
+
+        // Two earlier updates already staged copies here.
+        std::fs::write(
+            temp_dir
+                .path()
+                .join(format!("bedrock_server.exe{}", STALE_MARKER)),
+            b"v1",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join(format!("bedrock_server.exe{}.1", STALE_MARKER)),
+            b"v2",
+        )
+        .unwrap();
+
+        let stale = stale_path(&path);
+
+        assert_eq!(
+            stale.file_name().unwrap().to_str().unwrap(),
+            format!("bedrock_server.exe{}.2", STALE_MARKER)
+        );
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn test_is_stale_file_matches_bare_and_numbered_markers() {
+        let base = format!("/srv/bedrock_server.exe{}", STALE_MARKER);
+
+        assert!(is_stale_file(std::path::Path::new(&base)));
+        assert!(is_stale_file(std::path::Path::new(&format!("{}.1", base))));
+        assert!(is_stale_file(std::path::Path::new(&format!("{}.42", base))));
+    }
+
+    #[test]
+    fn test_is_stale_file_rejects_unrelated_names() {
+        assert!(!is_stale_file(std::path::Path::new(
+            "/srv/bedrock_server.exe"
+        )));
+        assert!(!is_stale_file(std::path::Path::new(
+            "/srv/server.properties"
+        )));
+        // A marker followed by something other than a numeric disambiguator is
+        // not a name this tool produces, so it is left alone.
+        assert!(!is_stale_file(std::path::Path::new(&format!(
+            "/srv/bedrock_server.exe{}.backup",
+            STALE_MARKER
+        ))));
+    }
+
+    #[test]
+    fn test_sweep_stale_files_removes_nested_stale_files() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("behavior_packs").join("pack");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        std::fs::write(
+            temp_dir.path().join(format!("server.exe{}", STALE_MARKER)),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(nested.join(format!("manifest.json{}", STALE_MARKER)), b"x").unwrap();
+        std::fs::write(temp_dir.path().join("keep.txt"), b"keep").unwrap();
+
+        let removed = sweep_stale_files(temp_dir.path());
+
+        assert_eq!(removed, 2);
+        assert!(
+            !temp_dir
+                .path()
+                .join(format!("server.exe{}", STALE_MARKER))
+                .exists()
+        );
+        assert!(
+            !nested
+                .join(format!("manifest.json{}", STALE_MARKER))
+                .exists()
+        );
+        // Unrelated files are untouched.
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("keep.txt")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn test_sweep_stale_files_empty_directory() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        assert_eq!(sweep_stale_files(temp_dir.path()), 0);
+    }
+
+    #[test]
+    fn test_sweep_stale_files_missing_directory() {
+        assert_eq!(
+            sweep_stale_files(std::path::Path::new("/no/such/directory/anywhere")),
+            0
+        );
+    }
+
+    // Tests for is_in_use_error
+
+    #[test]
+    fn test_is_in_use_error_classifies_sharing_violation() {
+        let sharing_violation =
+            std::io::Error::from_raw_os_error(if cfg!(windows) { 32 } else { 26 });
+
+        assert!(is_in_use_error(&sharing_violation));
+    }
+
+    #[test]
+    fn test_is_in_use_error_ignores_unrelated_errors() {
+        let not_found = std::io::Error::from_raw_os_error(2);
+
+        assert!(!is_in_use_error(&not_found));
     }
 }
