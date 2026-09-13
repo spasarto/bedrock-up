@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bedrock-up"]
+members = ["crates/bedrock-up", "crates/bedrock-supervisor"]
 
 [workspace.package]
 version = "0.1.0"
