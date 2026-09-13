@@ -1,5 +1,5 @@
+use bedrock_up::{DownloadType, UpdateConfig};
 use clap::Parser;
-use std::fmt;
 
 /// Manages Minecraft Bedrock Edition server updates.
 #[derive(Parser, Debug)]
@@ -33,27 +33,14 @@ pub struct UpdateArgs {
     pub(crate) exclude: Vec<String>,
 }
 
-use clap::ValueEnum;
-
-#[derive(Debug, Clone, ValueEnum)]
-pub enum DownloadType {
-    Windows,
-    Linux,
-    PreviewWindows,
-    PreviewLinux,
-    ServerJar,
-}
-
-impl fmt::Display for DownloadType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DownloadType::Windows => write!(f, "serverBedrockWindows"),
-            DownloadType::Linux => write!(f, "serverBedrockLinux"),
-            DownloadType::PreviewWindows => {
-                write!(f, "serverBedrockPreviewWindows")
-            }
-            DownloadType::PreviewLinux => write!(f, "serverBedrockPreviewLinux"),
-            DownloadType::ServerJar => write!(f, "serverJar"),
+impl From<UpdateArgs> for UpdateConfig {
+    fn from(args: UpdateArgs) -> Self {
+        UpdateConfig {
+            download_type: args.download_type,
+            server_path: std::path::PathBuf::from(shellexpand::tilde(&args.server_path).to_string()),
+            cache_path: std::path::PathBuf::from(shellexpand::tilde(&args.cache_path).to_string()),
+            exclude: args.exclude,
+            force: args.force,
         }
     }
 }

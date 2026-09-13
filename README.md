@@ -27,7 +27,7 @@ Options:
 If you have `cargo`
 
 ```shell
-cargo install --git https://github.com/spasarto/bedrock-up.git
+cargo install --git https://github.com/spasarto/bedrock-up.git bedrock-up
 ```
 
 If you don't have cargo, check out the releases 👉
