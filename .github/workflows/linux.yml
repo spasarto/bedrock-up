@@ -22,9 +22,15 @@ jobs:
     - name: Get Version
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: echo "VERSION=$(grep -m 1 'version = ' Cargo.toml | cut -d '"' -f 2)" >> $GITHUB_ENV
-    - name: Upload Artifact
+    - name: Upload bedrock-up Artifact
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       uses: actions/upload-artifact@v4
       with:
         name: bedrock-up-linux-${{env.VERSION}}
         path: target/x86_64-unknown-linux-gnu/release/bedrock-up
+    - name: Upload bedrock-supervisor Artifact
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/upload-artifact@v4
+      with:
+        name: bedrock-supervisor-linux-${{env.VERSION}}
+        path: target/x86_64-unknown-linux-gnu/release/bedrock-supervisor

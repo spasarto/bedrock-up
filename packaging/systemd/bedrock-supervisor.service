@@ -1,0 +1,36 @@
+[Unit]
+Description=Bedrock Dedicated Server (supervised)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory=/opt/bedrock/server
+
+# Adjust the path to the binary, the server directory, and the download
+# type (windows | linux | preview-windows | preview-linux | server-jar) for
+# your setup. See docs/deployment.md for the full flag reference.
+ExecStart=/usr/local/bin/bedrock-supervisor \
+    --download-type linux \
+    --server-path /opt/bedrock/server
+
+# systemd's default stop signal is SIGTERM, which bedrock-supervisor treats
+# the same as Ctrl+C: warn players, send `stop`, wait for the world to save,
+# and only then exit. TimeoutStopSec must comfortably exceed the countdown
+# (--warn-at, 100s by default) plus --stop-timeout (60s by default), or
+# systemd will send SIGKILL mid-shutdown and skip the save entirely.
+TimeoutStopSec=300
+
+# bedrock-supervisor already restarts a crashed server process internally
+# with its own backoff, and gives up (exits non-zero) after repeated
+# failures. Restart=on-failure lets systemd bring the supervisor itself back
+# after that, while a clean `systemctl stop` (exit 0) is left alone.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
