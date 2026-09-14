@@ -1,0 +1,32 @@
+[package]
+name = "bedrock-up"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "bedrock_up"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bedrock-up"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:env_logger"]
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"], optional = true }
+env_logger = { version = "0.11", optional = true }
+log = "0.4"
+reqwest = { version = "0.13.4", features = ["blocking", "json"] }
+serde_json = "1.0.151"
+shellexpand = "3.1.2"
+sysinfo = "0.38.4"
+tempfile = "3.27.0"
+thiserror = "2"
+zip = "8.6.0"
+
+[dev-dependencies]
+mockito = "1.7.2"
