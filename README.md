@@ -80,6 +80,25 @@ bedrock-up -d windows -s C:\minecraft
 if ($LASTEXITCODE -eq 2) { Restart-Service minecraft }
 ```
 
+### `download` / `apply` subcommands
+
+The default invocation above runs check → download → apply in one shot.
+`download` and `apply` split that into two standalone steps, so you can fetch
+the update ahead of a maintenance window — during the day, while the server
+is still busy — and do the fast filesystem swap later once it's stopped:
+
+```shell
+# Ahead of time: check for an update and stage it if one exists.
+bedrock-up download -d windows --stage-path ~/.bedrock-up/staged
+
+# Later, once the server is stopped: apply whatever was staged.
+bedrock-up apply -s C:\minecraft --stage-path ~/.bedrock-up/staged
+```
+
+`--stage-path` defaults to `~/.bedrock-up/staged` and must match between the
+two calls. Exit codes follow the same convention as the full pipeline: `0`
+nothing new (or nothing staged, for `apply`), `1` error, `2` staged / applied.
+
 ## `bedrock-supervisor`
 
 `bedrock-supervisor` runs the server for you and keeps it updated, instead of
@@ -140,6 +159,23 @@ manager) is relayed straight to the server, so `say hello`, `list`, and other
 console commands work exactly as if you'd started `bedrock_server` yourself.
 Ctrl+C (and `SIGTERM` on Linux) triggers the same graceful stop as an update:
 warn players, `stop`, wait, exit.
+
+### On-demand updates: `trigger-update`
+
+The `--check-interval` ticker covers routine updates, but sometimes you want
+one right now without waiting for it — or without restarting the supervisor,
+which `--update-on-start` would otherwise require. `trigger-update` connects
+to a running supervisor's control socket (a named pipe on Windows, a Unix
+domain socket on Linux) and asks it to run its normal check → download →
+warn → stop → apply → restart cycle immediately:
+
+```shell
+bedrock-supervisor trigger-update -s C:\minecraft
+```
+
+`--server-path` must match exactly what the running supervisor was started
+with — the socket's name is derived from it. This only nudges an
+already-running supervisor; it does not start one.
 
 ### Running it as a service
 

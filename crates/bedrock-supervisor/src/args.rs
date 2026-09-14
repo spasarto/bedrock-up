@@ -128,6 +128,18 @@ impl From<&ServerKind> for bedrock_up::DownloadType {
     }
 }
 
+/// Sends an on-demand update-check request to an already-running
+/// `bedrock-supervisor` over its control socket, instead of waiting for the
+/// next `--check-interval` tick. Does not start a supervisor itself.
+#[derive(Parser, Debug)]
+#[command(name = "bedrock-supervisor trigger-update", version, about, long_about = None)]
+pub struct TriggerUpdateArgs {
+    /// The running supervisor's server path — must match exactly what it was
+    /// started with, since the control socket's name is derived from it.
+    #[arg(short, long)]
+    pub server_path: String,
+}
+
 impl From<&SupervisorArgs> for SupervisorConfig {
     fn from(args: &SupervisorArgs) -> Self {
         SupervisorConfig {

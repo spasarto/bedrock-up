@@ -26,12 +26,29 @@ pub struct AvailableUpdate {
 /// the server should be stopped first.
 ///
 /// The backing temp directory is removed automatically when this value is
-/// dropped, whether or not `apply` is ever called.
+/// dropped, whether or not `apply` is ever called — unless it was produced
+/// by [`StagedUpdate::load`], in which case it survived a previous process
+/// on purpose and is only cleaned up on a successful `apply`.
 pub struct StagedUpdate {
     zip_path: PathBuf,
+    version: String,
     web_json: serde_json::Value,
-    _temp_dir: tempfile::TempDir,
+    cleanup: Cleanup,
 }
+
+enum Cleanup {
+    /// Never read; kept alive only so its `Drop` removes the temp directory.
+    TempDir(#[allow(dead_code)] tempfile::TempDir),
+    /// A directory written by `persist`, kept around after this process
+    /// exits so a later `apply` can pick it up. Removed once that `apply`
+    /// succeeds; left alone on `Drop` otherwise, so a discarded value here
+    /// doesn't destroy a stage nothing has consumed yet.
+    Persisted(PathBuf),
+}
+
+/// The sidecar file [`StagedUpdate::persist`] writes alongside the archive so
+/// [`StagedUpdate::load`] can reconstitute it in a later process.
+const STAGED_META_FILE: &str = "staged.json";
 
 /// Outcome of a successful [`StagedUpdate::apply`] call, used by callers
 /// (e.g. a supervisor) to decide whether the server needs to be restarted.
@@ -96,13 +113,20 @@ impl AvailableUpdate {
 
         Ok(StagedUpdate {
             zip_path,
+            version: self.version,
             web_json: self.web_json,
-            _temp_dir: temp_dir,
+            cleanup: Cleanup::TempDir(temp_dir),
         })
     }
 }
 
 impl StagedUpdate {
+    /// The version this staged archive will install, e.g. for a `download`
+    /// command to report what it fetched.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
     /// Applies the staged archive over `config.server_path`. Filesystem only
     /// and fast; the server should be stopped before calling this.
     pub fn apply(self, config: &UpdateConfig) -> Result<UpdateOutcome, UpdateError> {
@@ -123,6 +147,14 @@ impl StagedUpdate {
             }
         })?;
 
+        // Only now that the update landed (and the cache write above didn't
+        // bail out early) is a persisted stage no longer needed.
+        if let Cleanup::Persisted(dir) = &self.cleanup
+            && let Err(e) = std::fs::remove_dir_all(dir)
+        {
+            log::warn!("failed to clean up staging directory {}: {e}", dir.display());
+        }
+
         if staged.is_empty() {
             log::info!("Update applied successfully.");
             return Ok(UpdateOutcome::Updated);
@@ -135,6 +167,113 @@ impl StagedUpdate {
         report_running_servers(&config.server_path);
         Ok(UpdateOutcome::UpdatedPendingRestart)
     }
+
+    /// Persists this staged update to `dir`, so a later process can pick it
+    /// up with [`StagedUpdate::load`] instead of the archive being removed
+    /// when this value is dropped. `dir` is created if it doesn't exist.
+    ///
+    /// This is what backs the `bedrock-up download` / `bedrock-up apply`
+    /// split: `download` can run during the day while the server is up, and
+    /// `apply` at night once it's stopped, as two separate CLI invocations.
+    pub fn persist(self, dir: &Path) -> Result<(), UpdateError> {
+        std::fs::create_dir_all(dir).map_err(|source| UpdateError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+
+        let file_name = self.zip_path.file_name().ok_or_else(|| UpdateError::Io {
+            path: self.zip_path.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "archive path has no file name"),
+        })?;
+        let dest = dir.join(file_name);
+        move_file(&self.zip_path, &dest)?;
+
+        let meta = serde_json::json!({
+            "version": self.version,
+            "zip_file": file_name.to_string_lossy(),
+            "web_json": self.web_json,
+        });
+        let meta_path = dir.join(STAGED_META_FILE);
+        let file = std::fs::File::create(&meta_path).map_err(|source| UpdateError::Io {
+            path: meta_path.clone(),
+            source,
+        })?;
+        serde_json::to_writer(file, &meta).map_err(|e| UpdateError::Io {
+            path: meta_path,
+            source: std::io::Error::other(e),
+        })?;
+
+        // `self` is dropped here; its `Cleanup::TempDir` removes the now-empty
+        // temp directory the archive was moved out of.
+        Ok(())
+    }
+
+    /// Reconstitutes a [`StagedUpdate`] previously written by
+    /// [`StagedUpdate::persist`]. Returns `Ok(None)` if `dir` holds no staged
+    /// update — that's the expected state before the first `download`, not
+    /// an error.
+    pub fn load(dir: &Path) -> Result<Option<StagedUpdate>, UpdateError> {
+        let meta_path = dir.join(STAGED_META_FILE);
+        if !meta_path.exists() {
+            return Ok(None);
+        }
+
+        let invalid = |reason: String| UpdateError::Staging {
+            path: dir.to_path_buf(),
+            reason,
+        };
+
+        let content = std::fs::read_to_string(&meta_path).map_err(|source| UpdateError::Io {
+            path: meta_path.clone(),
+            source,
+        })?;
+        let meta: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| invalid(format!("malformed metadata: {e}")))?;
+
+        let version = meta
+            .get("version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid("metadata missing \"version\"".to_string()))?
+            .to_string();
+        let zip_file = meta
+            .get("zip_file")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid("metadata missing \"zip_file\"".to_string()))?;
+        let web_json = meta
+            .get("web_json")
+            .cloned()
+            .ok_or_else(|| invalid("metadata missing \"web_json\"".to_string()))?;
+
+        let zip_path = dir.join(zip_file);
+        if !zip_path.exists() {
+            return Err(invalid(format!("archive {} is missing", zip_path.display())));
+        }
+
+        Ok(Some(StagedUpdate {
+            zip_path,
+            version,
+            web_json,
+            cleanup: Cleanup::Persisted(dir.to_path_buf()),
+        }))
+    }
+}
+
+/// Moves a file, falling back to copy-then-remove when `rename` fails because
+/// the source and destination are on different filesystems (or drives, on
+/// Windows) — the case a fixed staging directory can't rule out the way a
+/// same-filesystem temp dir usually can.
+fn move_file(from: &Path, to: &Path) -> Result<(), UpdateError> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to).map_err(|source| UpdateError::Io {
+        path: to.to_path_buf(),
+        source,
+    })?;
+    std::fs::remove_file(from).map_err(|source| UpdateError::Io {
+        path: from.to_path_buf(),
+        source,
+    })
 }
 
 /// Names the processes still running the previous build out of `server_path`,
@@ -1420,10 +1559,92 @@ mod tests {
         // dir on drop.
         let staged = StagedUpdate {
             zip_path: zip_path.clone(),
+            version: "1.0.0".to_string(),
             web_json: json!({}),
-            _temp_dir: dir,
+            cleanup: Cleanup::TempDir(dir),
         };
         drop(staged);
         assert!(!zip_path.exists(), "temp dir should be removed on drop");
+    }
+
+    // Tests for persist / load
+
+    #[test]
+    fn test_persist_then_load_round_trip() {
+        use tempfile::TempDir;
+
+        let source_dir = TempDir::new().unwrap();
+        let zip_path = source_dir.path().join("update.zip");
+        std::fs::write(&zip_path, b"archive contents").unwrap();
+
+        let staged = StagedUpdate {
+            zip_path,
+            version: "1.2.3".to_string(),
+            web_json: json!({ "result": { "links": [] } }),
+            cleanup: Cleanup::TempDir(source_dir),
+        };
+
+        let stage_dir = TempDir::new().unwrap();
+        staged.persist(stage_dir.path()).unwrap();
+
+        let loaded = StagedUpdate::load(stage_dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.version(), "1.2.3");
+        assert_eq!(std::fs::read(&loaded.zip_path).unwrap(), b"archive contents");
+        assert_eq!(loaded.web_json, json!({ "result": { "links": [] } }));
+    }
+
+    #[test]
+    fn test_load_missing_stage_returns_none() {
+        use tempfile::TempDir;
+
+        let stage_dir = TempDir::new().unwrap();
+
+        assert!(StagedUpdate::load(stage_dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_malformed_metadata_is_an_error() {
+        use tempfile::TempDir;
+
+        let stage_dir = TempDir::new().unwrap();
+        std::fs::write(stage_dir.path().join(STAGED_META_FILE), b"not json").unwrap();
+
+        let result = StagedUpdate::load(stage_dir.path());
+
+        assert!(matches!(result, Err(UpdateError::Staging { .. })));
+    }
+
+    #[test]
+    fn test_apply_removes_persisted_stage_on_success() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let server_path = temp_dir.path().join("server");
+        let cache_path = temp_dir.path().join("cache.json");
+        let stage_dir = temp_dir.path().join("stage");
+
+        let source_dir = TempDir::new().unwrap();
+        let zip_path = source_dir.path().join("update.zip");
+        write_test_zip(&zip_path, &[("bedrock_server.exe", b"new binary")]);
+
+        let staged = StagedUpdate {
+            zip_path,
+            version: "1.2.3".to_string(),
+            web_json: json!({}),
+            cleanup: Cleanup::TempDir(source_dir),
+        };
+        staged.persist(&stage_dir).unwrap();
+
+        let loaded = StagedUpdate::load(&stage_dir).unwrap().unwrap();
+        let config = UpdateConfig {
+            download_type: DownloadType::Windows,
+            server_path,
+            cache_path,
+            exclude: vec![],
+            force: false,
+        };
+        loaded.apply(&config).unwrap();
+
+        assert!(!stage_dir.exists(), "persisted stage should be cleaned up after apply");
     }
 }

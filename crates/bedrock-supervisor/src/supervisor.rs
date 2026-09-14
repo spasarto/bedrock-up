@@ -5,10 +5,10 @@
 //! Threads, not async: `reqwest::blocking` (via `bedrock_up::check`) is
 //! already the shape everything here needs, and async would only be
 //! coordination tax. Producer threads (stdin, the update-check ticker, the
-//! signal handler) feed a single `mpsc::Receiver<Event>` that [`drive`]
-//! drains; child-exit detection is a poll on the receive timeout rather than
-//! a fourth thread, since `Child::try_wait` already needs the same `&mut
-//! Server` the rest of the loop uses.
+//! control socket, the signal handler) feed a single `mpsc::Receiver<Event>`
+//! that [`drive`] drains; child-exit detection is a poll on the receive
+//! timeout rather than a fifth thread, since `Child::try_wait` already needs
+//! the same `&mut Server` the rest of the loop uses.
 //!
 //! Console output is a pure relay — nothing here parses it. No decision this
 //! loop makes depends on the contents of a console line.
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use bedrock_up::{CheckOutcome, UpdateConfig, UpdateError, UpdateOutcome, check};
 
+use crate::control;
 use crate::server::{Server, ServerConfig, ServerError, StopOutcome};
 
 /// How often the run loop wakes up to poll for child exit when nothing else
@@ -68,6 +69,9 @@ pub enum Event {
     /// A line read from our own stdin, to be relayed to the child's.
     Command(String),
     ChildExited(ExitStatus),
+    /// Fired by the ticker on its normal schedule, or on demand by
+    /// `bedrock-supervisor trigger-update` over the control socket — either
+    /// way the run loop treats it identically.
     CheckUpdate,
     Shutdown,
 }
@@ -94,6 +98,7 @@ pub fn run(
     let (tx, rx) = mpsc::channel();
     spawn_stdin_relay(tx.clone());
     spawn_ticker(tx.clone(), config.check_interval);
+    control::spawn_listener(&config.server.server_path, tx.clone());
     install_signal_handler(tx);
 
     drive(server, rx, &config, on_console_line)

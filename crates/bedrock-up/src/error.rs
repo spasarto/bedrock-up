@@ -43,6 +43,12 @@ pub enum UpdateError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A `StagedUpdate::load` found a staging directory that is missing or
+    /// cannot be parsed as one this tool wrote — not retryable, since a
+    /// broken stage needs a fresh `download`, not another attempt to read it.
+    #[error("staged update at {} is invalid: {reason}", path.display())]
+    Staging { path: PathBuf, reason: String },
 }
 
 impl UpdateError {
