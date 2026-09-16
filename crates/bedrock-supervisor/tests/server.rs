@@ -90,11 +90,18 @@ fn console_relay_works_in_both_directions() {
 
 #[test]
 fn refuses_to_start_when_a_server_is_already_running_in_the_directory() {
-    // The test binary itself is a process, so pointing at its own directory
-    // makes `find_server_processes` find something without needing a real
-    // second bedrock_server.
-    let current_exe = std::env::current_exe().unwrap();
-    let exe_dir: PathBuf = current_exe.parent().unwrap().to_path_buf();
+    // Spawn a real fake-bedrock-server, then point a second config at the
+    // directory its executable actually lives in — the shared build output
+    // directory — so the second spawn must see it running there. (The
+    // calling test process itself is excluded from this check, so it can't
+    // be used to fake an "already running" hit anymore.)
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut running, _lines) = spawn_fake(dir.path(), vec![]);
+
+    let exe_dir: PathBuf = Path::new(&fake_server_exe())
+        .parent()
+        .unwrap()
+        .to_path_buf();
 
     let config = ServerConfig {
         server_path: exe_dir,
@@ -109,4 +116,8 @@ fn refuses_to_start_when_a_server_is_already_running_in_the_directory() {
         result.is_err(),
         "expected spawn to refuse an already-running directory"
     );
+
+    running
+        .graceful_stop(&[], Duration::from_secs(5))
+        .expect("graceful_stop failed");
 }
