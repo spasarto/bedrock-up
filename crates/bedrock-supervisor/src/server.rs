@@ -175,7 +175,13 @@ fn build_command(config: &ServerConfig) -> Command {
     let mut command = match &config.server_exe {
         Some(exe) => Command::new(exe),
         None => match config.kind {
-            ServerKind::Windows | ServerKind::PreviewWindows => Command::new("bedrock_server.exe"),
+            ServerKind::Windows | ServerKind::PreviewWindows => {
+                // A bare name is resolved via PATH only on Windows (Rust no
+                // longer implicitly searches the current directory, as a fix
+                // for binary-planting attacks) — the leading `.\` is required
+                // to make Rust treat it as relative to `current_dir()`.
+                Command::new(".\\bedrock_server.exe")
+            }
             ServerKind::Linux | ServerKind::PreviewLinux => {
                 let mut c = Command::new("./bedrock_server");
                 c.env("LD_LIBRARY_PATH", ".");
@@ -231,7 +237,7 @@ mod tests {
             server_exe: None,
             extra_args: vec![],
         });
-        assert_eq!(windows.get_program(), "bedrock_server.exe");
+        assert_eq!(windows.get_program(), ".\\bedrock_server.exe");
 
         let linux = build_command(&ServerConfig {
             server_path: PathBuf::from("."),
